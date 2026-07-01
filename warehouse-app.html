@@ -182,6 +182,9 @@ hr{border:none;border-top:1px solid var(--border);margin:20px 0;}
     <button class="sync-btn" id="push-btn" onclick="pushAllBins()" style="margin-top:8px;background:rgba(77,159,255,0.1);border-color:rgba(77,159,255,0.25);color:var(--blue);">
       <span id="push-icon">↑</span> Push all bins to SS
     </button>
+    <div style="text-align:center;margin-top:4px;">
+      <a href="#" style="font-size:10px;color:var(--text3);text-decoration:underline;" onclick="pushAllBins(true);return false;">force full re-push</a>
+    </div>
     <div class="sync-note" id="sync-note">Connect Sheet in Settings</div>
   </div>
 </aside>
@@ -692,6 +695,7 @@ async function saveBinEdit() {
         body: JSON.stringify(payload)
       });
       const result = await resp.json();
+      if (result.success && b.product) b._pushed = binFingerprint(b);
       statusEl.textContent = result.success ? 'ShipStation updated ✓' : 'ShipStation update failed';
       setTimeout(() => statusEl.textContent = 'Synced', 3000);
     } catch(e) {
@@ -838,6 +842,7 @@ async function confirmMove() {
         })
       });
       const result = await resp.json();
+      if (result.success) to._pushed = binFingerprint(to);
       statusEl.textContent = result.success ? 'ShipStation updated ✓' : 'ShipStation update failed';
     } catch (e) {
       statusEl.textContent = 'ShipStation update failed';
@@ -1012,7 +1017,10 @@ async function confirmAllAssignments() {
           body: JSON.stringify(payload)
         });
         const result = await resp.json();
-        if (result.success) shipstationCount++;
+        if (result.success) {
+          shipstationCount++;
+          if (b) b._pushed = binFingerprint(b);
+        }
         else errors.push(item.sku + ': ' + result.message);
       } catch(e) {
         errors.push(item.sku + ': network error');
@@ -1237,8 +1245,19 @@ function exportPickList() {
   a.click();
 }
 
-// Push all occupied bins to ShipStation via Apps Script
-async function pushAllBins() {
+// Fingerprint of a bin's ShipStation-relevant state, used to skip re-pushing
+// bins that haven't changed since their last successful push.
+function binFingerprint(b) {
+  return (b.sku || '') + '|' + b.num + '|' + (b.product || '');
+}
+
+// Push occupied bins to ShipStation via Apps Script.
+// Runs several requests concurrently (instead of one at a time) and, unless
+// forced, skips bins whose SKU/bin/product haven't changed since they were
+// last successfully pushed — this is what makes repeat pushes fast.
+const PUSH_CONCURRENCY = 4;
+
+async function pushAllBins(force) {
   if (!settings.urlScript) {
     alert('Apps Script URL not set in Settings.');
     return;
@@ -1246,17 +1265,28 @@ async function pushAllBins() {
   const occupied = bins.filter(b => b.product && b.sku);
   if (!occupied.length) { alert('No occupied bins with SKUs to push.'); return; }
 
+  const toPush = force ? occupied : occupied.filter(b => b._pushed !== binFingerprint(b));
+  const skippedUnchanged = occupied.length - toPush.length;
+
+  const statusEl = document.getElementById('sync-note');
+  if (!toPush.length) {
+    statusEl.textContent = 'Already in sync — ' + occupied.length + ' bins unchanged since last push';
+    setTimeout(() => statusEl.textContent = 'Synced', 4000);
+    return;
+  }
+
   const btn = document.getElementById('push-btn');
   const icon = document.getElementById('push-icon');
   btn.disabled = true;
   icon.innerHTML = '<span class="spin"></span>';
-  document.getElementById('sync-note').textContent = 'Pushing to ShipStation...';
 
-  let success = 0;
-  let skipped = 0;
-  let errors = 0;
+  let success = 0, failed = 0, errors = 0, done = 0;
+  const updateProgress = () => {
+    statusEl.textContent = `Pushing to ShipStation... ${done}/${toPush.length}`;
+  };
+  updateProgress();
 
-  for (const bin of occupied) {
+  async function pushOne(bin) {
     try {
       const resp = await fetch(settings.urlScript, {
         method: 'POST',
@@ -1268,18 +1298,36 @@ async function pushAllBins() {
         })
       });
       const result = await resp.json();
-      if (result.success) success++;
-      else skipped++;
-    } catch(e) {
+      if (result.success) { success++; bin._pushed = binFingerprint(bin); }
+      else failed++;
+    } catch (e) {
       errors++;
+    } finally {
+      done++;
+      updateProgress();
     }
   }
 
+  // Simple concurrency-limited worker pool so we're not waiting on one
+  // request at a time, but also not firing hundreds at once.
+  let idx = 0;
+  async function worker() {
+    while (idx < toPush.length) {
+      const bin = toPush[idx++];
+      await pushOne(bin);
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(PUSH_CONCURRENCY, toPush.length) }, worker));
+
+  save();
   btn.disabled = false;
   icon.textContent = '↑';
-  const msg = success + ' updated, ' + skipped + ' skipped, ' + errors + ' errors';
-  document.getElementById('sync-note').textContent = msg;
-  setTimeout(() => document.getElementById('sync-note').textContent = 'Synced', 5000);
+  let msg = success + ' updated';
+  if (skippedUnchanged) msg += ', ' + skippedUnchanged + ' unchanged (skipped)';
+  if (failed) msg += ', ' + failed + ' rejected by ShipStation';
+  if (errors) msg += ', ' + errors + ' errors';
+  statusEl.textContent = msg;
+  setTimeout(() => statusEl.textContent = 'Synced', 6000);
 }
 
 
