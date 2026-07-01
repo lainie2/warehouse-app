@@ -319,7 +319,7 @@ hr{border:none;border-top:1px solid var(--border);margin:20px 0;}
   <div class="dlabel">Current bins (<span id="setup-count">0</span>)</div>
   <div class="tw">
     <table>
-      <colgroup><col style="width:80px"><col style="width:60px"><col style="width:auto"><col style="width:120px"><col style="width:80px"><col style="width:160px"><col style="width:70px"></colgroup>
+      <colgroup><col style="width:80px"><col style="width:60px"><col style="width:auto"><col style="width:120px"><col style="width:80px"><col style="width:110px"><col style="width:220px"></colgroup>
       <thead><tr><th>Bin #</th><th>Size</th><th>Product</th><th>SKU</th><th>Shopify qty</th><th>Notes</th><th></th></tr></thead>
       <tbody id="setup-body"></tbody>
     </table>
@@ -378,8 +378,22 @@ hr{border:none;border-top:1px solid var(--border);margin:20px 0;}
     <div class="modal-title" id="modal-title">Bin details</div>
     <div id="modal-body"></div>
     <div class="modal-foot">
+      <button class="btn btn-sm btn-d" onclick="unassignFromDetail()">Unassign SKU</button>
+      <button class="btn btn-sm mla" onclick="moveFromDetail()">Move to bin</button>
       <button class="btn btn-sm" onclick="closeModal()">Close</button>
       <button class="btn btn-p btn-sm" onclick="saveBinEdit()">Save</button>
+    </div>
+  </div>
+</div>
+
+<!-- Move bin modal -->
+<div class="overlay" id="move-modal">
+  <div class="modal">
+    <div class="modal-title" id="move-modal-title">Move product to another bin</div>
+    <div id="move-modal-body"></div>
+    <div class="modal-foot">
+      <button class="btn btn-sm" onclick="closeMoveModal()">Cancel</button>
+      <button class="btn btn-p btn-sm" onclick="confirmMove()">Move</button>
     </div>
   </div>
 </div>
@@ -397,6 +411,7 @@ let orderFilter = 'all';
 let orderSearch = '';
 let binSearch = '';
 let editingBin = null;
+let movingBin = null;
 let receiveRows = [];
 
 function save() {
@@ -687,6 +702,149 @@ async function saveBinEdit() {
 }
 
 function closeModal() { document.getElementById('bin-modal').classList.remove('open'); editingBin = null; }
+
+// Unassign / Move shortcuts from the bin detail modal
+async function unassignFromDetail() {
+  const num = editingBin;
+  if (num === null) return;
+  closeModal();
+  await unassignSku(num);
+}
+
+function moveFromDetail() {
+  const num = editingBin;
+  if (num === null) return;
+  closeModal();
+  openMoveModal(num);
+}
+
+// ============================================================
+// UNASSIGN SKU — clear a product/SKU from a bin, keep the bin location itself
+// ============================================================
+async function unassignSku(num) {
+  const b = bins.find(x => x.num === num);
+  if (!b) return;
+  if (!b.product && !b.sku) { alert('Bin ' + num + ' has no SKU assigned.'); return; }
+
+  const label = b.product || b.sku;
+  if (!confirm('Unassign "' + label + '" from bin ' + num + '? The bin location stays — this just clears the SKU here and in ShipStation.')) return;
+
+  const sku = b.sku;
+  b.product = '';
+  b.sku = '';
+  b.quantity = undefined;
+  b.stockStatus = undefined;
+  save();
+  renderSetup();
+  renderDashboard();
+  if (document.getElementById('page-cycle').classList.contains('active')) renderCycle();
+
+  if (settings.urlScript && sku) {
+    const statusEl = document.getElementById('sync-note');
+    statusEl.textContent = 'Updating ShipStation...';
+    try {
+      const resp = await fetch(settings.urlScript, {
+        method: 'POST',
+        body: JSON.stringify({
+          action: 'clearBin',
+          sku: sku,
+          binNum: num
+        })
+      });
+      const result = await resp.json();
+      statusEl.textContent = result.success ? 'ShipStation updated ✓' : 'ShipStation update failed';
+    } catch (e) {
+      statusEl.textContent = 'ShipStation update failed';
+    }
+    setTimeout(() => statusEl.textContent = 'Synced', 3000);
+  }
+}
+
+// ============================================================
+// MOVE / SWITCH BIN — relocate a product's inventory to a different bin
+// ============================================================
+function openMoveModal(num) {
+  const from = bins.find(b => b.num === num);
+  if (!from) return;
+  if (!from.product) { alert('Bin ' + num + ' is empty — nothing to move.'); return; }
+
+  movingBin = num;
+  const candidates = bins.filter(b => b.num !== num).slice().sort((a, b) => {
+    const aOcc = a.product ? 1 : 0, bOcc = b.product ? 1 : 0;
+    if (aOcc !== bOcc) return aOcc - bOcc; // empty bins first
+    if (a.size !== b.size) return a.size === from.size ? -1 : b.size === from.size ? 1 : 0;
+    return a.num - b.num;
+  });
+
+  document.getElementById('move-modal-title').textContent = 'Move "' + from.product + '" (bin ' + num + ', ' + from.size + ')';
+  document.getElementById('move-modal-body').innerHTML = `
+    <p style="font-size:12px;color:var(--text2);margin-bottom:12px;">SKU: <span class="mono">${from.sku || '—'}</span> · Qty: ${from.quantity !== undefined && from.quantity !== null ? from.quantity : '—'}</p>
+    <div class="fg" style="margin-bottom:12px;">
+      <label>Destination bin</label>
+      <select id="move-dest">
+        <option value="">Choose a bin...</option>
+        ${candidates.map(b => `<option value="${b.num}">${b.num} — ${b.size}${b.product ? ' (occupied: ' + b.product + ')' : ' (empty)'}${b.notes ? ' — ' + b.notes : ''}</option>`).join('')}
+      </select>
+    </div>
+    <p style="font-size:12px;color:var(--text3);">Moving will update the bin location for this SKU in ShipStation automatically.</p>
+  `;
+  document.getElementById('move-modal').classList.add('open');
+}
+
+function closeMoveModal() {
+  document.getElementById('move-modal').classList.remove('open');
+  movingBin = null;
+}
+
+async function confirmMove() {
+  const destVal = document.getElementById('move-dest').value;
+  const toNum = parseInt(destVal);
+  if (!destVal || isNaN(toNum)) { alert('Choose a destination bin.'); return; }
+
+  const from = bins.find(b => b.num === movingBin);
+  const to = bins.find(b => b.num === toNum);
+  if (!from || !to) return;
+  if (to.product && !confirm('Bin ' + toNum + ' already has "' + to.product + '" — overwrite it?')) return;
+
+  const sku = from.sku;
+
+  to.product = from.product;
+  to.sku = from.sku;
+  to.quantity = from.quantity;
+  to.stockStatus = from.stockStatus;
+
+  from.product = '';
+  from.sku = '';
+  from.quantity = undefined;
+  from.stockStatus = undefined;
+
+  save();
+  closeMoveModal();
+  renderSetup();
+  renderDashboard();
+  if (document.getElementById('page-cycle').classList.contains('active')) renderCycle();
+
+  if (settings.urlScript && sku) {
+    const statusEl = document.getElementById('sync-note');
+    statusEl.textContent = 'Updating ShipStation...';
+    try {
+      const resp = await fetch(settings.urlScript, {
+        method: 'POST',
+        body: JSON.stringify({
+          action: 'assignBin',
+          sku: sku,
+          binNum: toNum,
+          productName: to.product
+        })
+      });
+      const result = await resp.json();
+      statusEl.textContent = result.success ? 'ShipStation updated ✓' : 'ShipStation update failed';
+    } catch (e) {
+      statusEl.textContent = 'ShipStation update failed';
+    }
+    setTimeout(() => statusEl.textContent = 'Synced', 3000);
+  }
+}
 
 // ============================================================
 // RECEIVE — BULK
@@ -1137,7 +1295,13 @@ function renderSetup() {
     <td class="mono" style="font-size:12px;color:var(--text2);">${b.sku||'—'}</td>
     <td class="mono">${b.quantity!==undefined?b.quantity:'—'}</td>
     <td style="font-size:12px;color:var(--text2);">${b.notes||''}</td>
-    <td><button class="btn btn-sm btn-d" onclick="removeBin(${b.num})">Remove</button></td>
+    <td>
+      <div class="flex" style="gap:6px;flex-wrap:wrap;">
+        ${b.product ? `<button class="btn btn-sm btn-d" onclick="unassignSku(${b.num})">Unassign</button>` : ''}
+        ${b.product ? `<button class="btn btn-sm" onclick="openMoveModal(${b.num})">Move</button>` : ''}
+        <button class="btn btn-sm" style="color:var(--text3);" onclick="removeBin(${b.num})" title="Delete this bin location entirely">Remove bin</button>
+      </div>
+    </td>
   </tr>`).join('');
 }
 
@@ -1172,10 +1336,38 @@ function bulkAdd() {
   if (skipped) alert(`Added ${added} bins. ${skipped} skipped (duplicates or bad format).`);
 }
 
-function removeBin(num) {
-  if (!confirm('Remove bin ' + num + '?')) return;
-  bins = bins.filter(b => b.num !== num);
+async function removeBin(num) {
+  const b = bins.find(x => x.num === num);
+  if (!b) return;
+  const confirmMsg = b.product
+    ? 'Delete bin ' + num + ' ("' + b.product + '")? This removes the bin location entirely and clears it in ShipStation.'
+    : 'Delete bin ' + num + '? This removes the bin location entirely.';
+  if (!confirm(confirmMsg)) return;
+
+  const sku = b.sku;
+  bins = bins.filter(x => x.num !== num);
   save(); renderSetup(); renderDashboard();
+
+  // If a product/SKU was assigned here, clear the bin location in ShipStation too
+  if (settings.urlScript && sku) {
+    const statusEl = document.getElementById('sync-note');
+    statusEl.textContent = 'Updating ShipStation...';
+    try {
+      const resp = await fetch(settings.urlScript, {
+        method: 'POST',
+        body: JSON.stringify({
+          action: 'clearBin',
+          sku: sku,
+          binNum: num
+        })
+      });
+      const result = await resp.json();
+      statusEl.textContent = result.success ? 'ShipStation updated ✓' : 'ShipStation update failed';
+    } catch (e) {
+      statusEl.textContent = 'ShipStation update failed';
+    }
+    setTimeout(() => statusEl.textContent = 'Synced', 3000);
+  }
 }
 
 function clearAllBins() {
